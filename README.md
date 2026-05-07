@@ -72,10 +72,13 @@ security-auditor/  (this repo)
 ## Screenshots
 
 ### Shift left — PR blocked on HIGH severity finding
+to be done 
 ![Shift left PR comment showing security findings](.github/screenshots/shift-left-pr-comment.png)
 
 ### Shift left — PR passes after fixing findings
+to be done
 ![Shift left PR passing](.github/screenshots/shift-left-pr-pass.png)
+
 
 ### Weekly remediation — master summary Issue
 ![Master audit Issue showing RG breakdown](.github/screenshots/remediation-master-issue.png)
@@ -88,6 +91,7 @@ security-auditor/  (this repo)
 
 ### Azure Policy compliance view
 ![Azure Policy compliance dashboard](.github/screenshots/azure-policy-compliance.png)
+
 
 > 📸 Add screenshots to `.github/screenshots/` after your first scan run.
 
