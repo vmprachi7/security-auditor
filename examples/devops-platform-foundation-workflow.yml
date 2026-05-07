@@ -1,0 +1,24 @@
+name: Terraform Security Scan
+
+# Add this file to devops-platform-foundation repo:
+# .github/workflows/terraform-security-scan.yml
+#
+# This calls the reusable shift-left workflow from security-auditor.
+# Every Terraform PR gets scanned automatically.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '*.tf'
+
+jobs:
+  security-scan:
+    name: Shift Left Security Scan
+    uses: vmprachi7/security-auditor/.github/workflows/shift-left.yml@main
+    with:
+      terraform_dir: 'terraform'
+      block_on_high: true
+    secrets:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
