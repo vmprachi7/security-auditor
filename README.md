@@ -69,6 +69,30 @@ security-auditor/  (this repo)
 
 ---
 
+## Screenshots
+
+### Shift left — PR blocked on HIGH severity finding
+![Shift left PR comment showing security findings](.github/screenshots/shift-left-pr-comment.png)
+
+### Shift left — PR passes after fixing findings
+![Shift left PR passing](.github/screenshots/shift-left-pr-pass.png)
+
+### Weekly remediation — master summary Issue
+![Master audit Issue showing RG breakdown](.github/screenshots/remediation-master-issue.png)
+
+### Weekly remediation — RG Issue with findings
+![RG Issue with collapsible finding details](.github/screenshots/remediation-rg-issue.png)
+
+### Weekly remediation — finding detail with Terraform patch
+![Finding detail showing dependency analysis and Terraform patch](.github/screenshots/remediation-finding-detail.png)
+
+### Azure Policy compliance view
+![Azure Policy compliance dashboard](.github/screenshots/azure-policy-compliance.png)
+
+> 📸 Add screenshots to `.github/screenshots/` after your first scan run.
+
+---
+
 ## GitHub Issue structure
 
 Each weekly scan creates:
@@ -99,6 +123,37 @@ When all RG Issues are closed — close the master Issue.
 - GitHub PAT with `repo` scope
 - Groq API key (free — [console.groq.com](https://console.groq.com))
 - Prowler 4.x installed: `pip install prowler`
+
+### ⚠️ Required: Tag your Azure resources
+
+The dependency analysis and sign-off routing only work if your Azure resources
+have the correct tags. Without tags, the tool cannot determine who owns a resource
+or who needs to approve a patch.
+
+**Minimum required tags on every resource group:**
+
+```bash
+# Tag a resource group
+az group update   --name devops-platform-rg   --tags owner="platform-team"         environment="production"         stakeholders="platform,finops,aiops"
+
+# Tag a storage account
+az resource update   --ids /subscriptions/.../storageAccounts/devopsplatformacr   --set tags.owner="platform-team"        tags.environment="production"        tags.stakeholders="platform,finops"
+```
+
+**Tag reference:**
+
+| Tag | Required | Example | Used for |
+|---|---|---|---|
+| `owner` | ✅ Yes | `platform-team` | Sign-off routing — who approves patches |
+| `environment` | ✅ Yes | `production` / `dev` | Risk scoring — prod = higher blast radius |
+| `stakeholders` | Recommended | `platform,finops` | Comma-separated teams who use this resource |
+
+**Without `owner` tag:** the tool will still create Issues but cannot route
+sign-off automatically. You will see `owner: unknown` in the dependency analysis.
+
+**Tip — enforce tagging with Azure Policy:** The `require_resource_tags.json`
+policy in this repo audits resource groups without an `owner` tag. Run
+`bash policies/apply_policies.sh` to apply it at subscription scope.
 
 ### Local setup
 
@@ -302,6 +357,57 @@ USE_MOCK_DATA=false            # true = use mock findings (no Azure needed)
 
 ---
 
+## ⚠️ Security notice — Groq AI in production
+
+This tool uses [Groq's free tier](https://console.groq.com) to generate
+Terraform patch explanations and finding summaries.
+
+**What is sent to Groq:**
+- Security finding title and description (from Prowler)
+- Resource name, resource group, resource type
+- Prowler check ID and remediation guidance
+
+**What is NOT sent to Groq:**
+- Subscription ID or tenant ID
+- Actual resource configurations or secrets
+- Network topology or IP addresses
+
+**For most teams this is acceptable** — finding titles like
+*"Storage account allows public blob access"* and resource names
+are not sensitive data.
+
+**For compliance-sensitive environments** (SOC 2, ISO 27001, HIPAA,
+financial services, government) review whether sending resource names
+and finding descriptions to a third-party API is acceptable under
+your data classification policy.
+
+### Production alternatives
+
+| Option | How | Trade-off |
+|---|---|---|
+| **Azure OpenAI Service** | Deploy GPT-4o inside your Azure tenant | Costs money, data never leaves your subscription |
+| **Ollama (self-hosted)** | Run Llama 3.1 on a VM inside your VNet | Free, fully private, needs compute |
+| **Disable AI layer** | Set `GROQ_API_KEY=` to empty | Falls back to rule-based patches — still works |
+
+### Swapping to Azure OpenAI — one file change
+
+In `remediation/patch_generator.py` and `shift-left/ai_explainer.py`,
+replace the Groq client with:
+
+```python
+# Azure OpenAI — data stays in your tenant
+client = OpenAI(
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    base_url=f"{os.getenv('AZURE_OPENAI_ENDPOINT')}/openai/deployments/gpt-4o",
+    default_headers={"api-key": os.getenv("AZURE_OPENAI_KEY")},
+)
+```
+
+The AI layer is intentionally provider-agnostic — swapping providers
+requires changing two lines, not a refactor.
+
+---
+
 ## Risk levels and sign-off requirements
 
 | Risk | Approval required | Apply how |
@@ -318,14 +424,18 @@ A human reviews, approves, and applies it.
 
 ## Technology stack
 
-| Component | Technology | Why |
-|---|---|---|
-| Security scanning | Prowler 4.x | Open source, 300+ Azure checks, free |
-| Shift left | Checkov + tfsec | Industry standard IaC scanners |
-| AI explanation | Groq (Llama 3.1) | Free tier, fast, good quality |
-| Dependency analysis | ARM Resource Graph + Azure Monitor | Native Azure APIs |
-| Issue management | PyGithub | GitHub Issues as audit trail |
-| Authentication | Azure SP + OIDC | Passwordless CI/CD |
+| Layer | Component | Version | Why chosen |
+|---|---|---|---|
+| **Security scanning** | [Prowler](https://github.com/prowler-cloud/prowler) | 4.x | Open source CSPM, 300+ Azure checks, used at Netflix/Twilio, free |
+| **Shift left — IaC** | [Checkov](https://github.com/bridgecrewio/checkov) | 3.x | Industry standard, 1000+ Terraform rules, integrates with GitHub Actions |
+| **Shift left — Azure** | [tfsec](https://github.com/aquasecurity/tfsec) | latest | Azure-specific rules, faster than Checkov for targeted scans |
+| **AI layer** | [Groq](https://console.groq.com) + Llama 3.1 | llama-3.1-8b-instant | Free tier, <2s response, provider-agnostic (swap to Azure OpenAI for prod) |
+| **Dependency analysis** | ARM Resource Graph | Azure SDK | Query all Azure resources + relationships in one API call |
+| **Access history** | Azure Monitor Activity Logs | azure-mgmt-monitor 6.x | Who accessed a resource in the last 30 days |
+| **Issue management** | [PyGithub](https://github.com/PyGithub/PyGithub) | 2.1.1 | GitHub Issues as structured audit trail with checklists |
+| **Authentication** | Azure SP + OIDC (Workload Identity) | — | Passwordless CI/CD — no stored credentials, short-lived tokens |
+| **Policy enforcement** | Azure Policy | — | Deny non-compliant resources at deployment time, not after |
+| **Language** | Python | 3.11 | Matches rest of portfolio, rich Azure SDK ecosystem |
 
 ---
 
