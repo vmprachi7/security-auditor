@@ -103,6 +103,10 @@ def _get_recent_accessors(finding: Finding) -> list[dict]:
     Query Azure Monitor activity logs to find who accessed
     this resource in the last DEPENDENCY_LOOKBACK_DAYS days.
     """
+    # Skip subscription-level findings — no resource URI to query
+    if not finding.resource_id or "/" not in finding.resource_id:
+        return []
+
     try:
         from azure.mgmt.monitor import MonitorManagementClient
         from datetime import datetime, timedelta, timezone

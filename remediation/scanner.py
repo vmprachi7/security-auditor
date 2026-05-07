@@ -211,6 +211,18 @@ def _run_prowler(output_file: str):
     print(f"  ✅ Prowler completed — output: {files[0]}")
 
 
+def _make_short_id(check_id: str) -> str:
+    """Generate a clean short ID from a Prowler check ID."""
+    # azure_storage_account_public_access_level_is_disabled
+    # → PRW-STORAGE-001 style
+    parts = check_id.replace("azure_", "").split("_")
+    if len(parts) >= 2:
+        service = parts[0][:4].upper()
+        detail  = parts[1][:4].upper() if len(parts) > 1 else "MISC"
+        return f"PRW-{service}-{detail}"
+    return f"PRW-{check_id[:8].upper()}"
+
+
 def _parse_prowler_output(output_file: str) -> list[Finding]:
     """Parse Prowler JSON-OCSF output."""
     findings = []
@@ -248,7 +260,7 @@ def _parse_prowler_output(output_file: str) -> list[Finding]:
         resource_type = resource.get("type", record.get("resource_type", "unknown"))
 
         parts          = resource_id.split("/") if resource_id else []
-        resource_group = parts[4] if len(parts) > 4 else "unknown"
+        resource_group = parts[4] if len(parts) > 4 else "subscription-level"
 
         # Check info
         finding_info = record.get("finding_info", {})
@@ -275,7 +287,11 @@ def _parse_prowler_output(output_file: str) -> list[Finding]:
         service = cloud.get("service", {}) if isinstance(cloud, dict) else {}
         service_name = service.get("name", "azure") if isinstance(service, dict) else str(service)
 
-        short_id = f"PRW-{check_id[-8:].upper()}" if len(check_id) > 8 else f"PRW-{check_id.upper()}"
+        # Generate clean short ID from check name
+        # e.g. azure_storage_account_public_access → PRW-STORAGE-001
+        parts_id = check_id.replace("azure_", "").split("_")
+        service_short = parts_id[0].upper()[:6] if parts_id else "AZURE"
+        short_id = f"PRW-{service_short}-{abs(hash(check_id)) % 1000:03d}"
 
         findings.append(Finding(
             resource_id=resource_id,
@@ -312,7 +328,8 @@ def _enrich_with_tags(findings: list[Finding]):
         for resource in client.resources.list():
             tag_cache[resource.id.lower()] = resource.tags or {}
         for finding in findings:
-            if finding.resource_id:
+            # Skip subscription-level findings with no resource ID
+            if finding.resource_id and "/" in finding.resource_id:
                 finding.tags = tag_cache.get(finding.resource_id.lower(), {})
         print(f"  ✅ Tags enriched for {len(findings)} findings")
     except Exception as e:
