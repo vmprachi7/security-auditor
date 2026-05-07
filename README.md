@@ -42,6 +42,23 @@ Custom policy definitions applied at subscription scope:
 
 ---
 
+## Technology stack
+
+| Layer | Component | Version | Why chosen |
+|---|---|---|---|
+| **Security scanning** | [Prowler](https://github.com/prowler-cloud/prowler) | 4.x | Open source CSPM, 300+ Azure checks, used at Netflix/Twilio, free |
+| **Shift left — IaC** | [Checkov](https://github.com/bridgecrewio/checkov) | 3.x | Industry standard, 1000+ Terraform rules, integrates with GitHub Actions |
+| **Shift left — Azure** | [tfsec](https://github.com/aquasecurity/tfsec) | latest | Azure-specific rules, faster than Checkov for targeted scans |
+| **AI layer** | [Groq](https://console.groq.com) + Llama 3.1 | llama-3.1-8b-instant | Free tier, <2s response, provider-agnostic (swap to Azure OpenAI for prod) |
+| **Dependency analysis** | ARM Resource Graph | Azure SDK | Query all Azure resources + relationships in one API call |
+| **Access history** | Azure Monitor Activity Logs | azure-mgmt-monitor 6.x | Who accessed a resource in the last 30 days |
+| **Issue management** | [PyGithub](https://github.com/PyGithub/PyGithub) | 2.1.1 | GitHub Issues as structured audit trail with checklists |
+| **Authentication** | Azure SP + OIDC (Workload Identity) | — | Passwordless CI/CD — no stored credentials, short-lived tokens |
+| **Policy enforcement** | Azure Policy | — | Deny non-compliant resources at deployment time, not after |
+| **Language** | Python | 3.11 | Matches rest of portfolio, rich Azure SDK ecosystem |
+
+---
+
 ## Architecture
 
 ```
@@ -423,23 +440,6 @@ requires changing two lines, not a refactor.
 **Nothing is ever applied automatically.**
 The tool generates the Terraform patch and routes it to the right people.
 A human reviews, approves, and applies it.
-
----
-
-## Technology stack
-
-| Layer | Component | Version | Why chosen |
-|---|---|---|---|
-| **Security scanning** | [Prowler](https://github.com/prowler-cloud/prowler) | 4.x | Open source CSPM, 300+ Azure checks, used at Netflix/Twilio, free |
-| **Shift left — IaC** | [Checkov](https://github.com/bridgecrewio/checkov) | 3.x | Industry standard, 1000+ Terraform rules, integrates with GitHub Actions |
-| **Shift left — Azure** | [tfsec](https://github.com/aquasecurity/tfsec) | latest | Azure-specific rules, faster than Checkov for targeted scans |
-| **AI layer** | [Groq](https://console.groq.com) + Llama 3.1 | llama-3.1-8b-instant | Free tier, <2s response, provider-agnostic (swap to Azure OpenAI for prod) |
-| **Dependency analysis** | ARM Resource Graph | Azure SDK | Query all Azure resources + relationships in one API call |
-| **Access history** | Azure Monitor Activity Logs | azure-mgmt-monitor 6.x | Who accessed a resource in the last 30 days |
-| **Issue management** | [PyGithub](https://github.com/PyGithub/PyGithub) | 2.1.1 | GitHub Issues as structured audit trail with checklists |
-| **Authentication** | Azure SP + OIDC (Workload Identity) | — | Passwordless CI/CD — no stored credentials, short-lived tokens |
-| **Policy enforcement** | Azure Policy | — | Deny non-compliant resources at deployment time, not after |
-| **Language** | Python | 3.11 | Matches rest of portfolio, rich Azure SDK ecosystem |
 
 ---
 
