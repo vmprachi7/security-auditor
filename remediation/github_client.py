@@ -1,19 +1,15 @@
 """
 GitHub client for security-auditor.
 
-Issue hierarchy per scan:
+Issue structure per scan run:
 
-  #N   🔍 Weekly Audit — 2026-05-06 — 5 findings        (master summary)
-         └── #N+1 📦 devops-platform-rg — 3 findings    (per RG)
-                    └── #N+2 🔴 Storage public access   (per finding)
-                    └── #N+3 🔴 AKS public API server
-                    └── #N+4 🟡 Key Vault soft delete
-         └── #N+5 📦 finops-rg — 2 findings
-                    └── #N+6 🟡 Storage geo-redundancy
-                    └── #N+7 🟢 Missing owner tag
+  #N  🔍 Weekly Audit — 2026-05-07 — 3 RGs — 12 findings  (master)
+        └── #N+1 📦 devops-platform-rg — 8 findings        (one per RG)
+        └── #N+2 📦 finops-rg — 3 findings
+        └── #N+3 📦 audit-test-rg — 1 finding
 
-When a finding Issue is closed → checkbox in RG Issue auto-ticks.
-When all finding Issues closed → RG Issue shows 100% complete.
+Each RG Issue contains ALL findings for that RG in one place.
+Only HIGH and MEDIUM findings are actioned — LOW are listed but not detailed.
 """
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -24,27 +20,21 @@ from remediation.dependency import DependencyReport
 from remediation.patch_generator import Patch
 
 
-# ── Labels ────────────────────────────────────────────────────
-
 LABELS = [
-    ("security",         "e53e3e", "Security finding from Defender for Cloud"),
-    ("risk-high",        "b60205", "HIGH risk — CISO sign-off required"),
-    ("risk-medium",      "e4e669", "MEDIUM risk — team lead sign-off required"),
-    ("risk-low",         "0e8a16", "LOW risk — single reviewer required"),
-    ("audit-master",     "0075ca", "Weekly audit master summary"),
-    ("audit-rg",         "5319e7", "Per resource group audit summary"),
-    ("audit-finding",    "f9d0c4", "Individual security finding"),
+    ("security",      "e53e3e", "Security finding from Prowler scan"),
+    ("audit-master",  "0075ca", "Weekly audit master summary"),
+    ("audit-rg",      "5319e7", "Per resource group security findings"),
+    ("risk-high",     "b60205", "HIGH risk findings"),
+    ("risk-medium",   "e4e669", "MEDIUM risk findings"),
 ]
 
 
-# ── Main entry point ──────────────────────────────────────────
-
 def create_audit_hierarchy(
     report:        ScanReport,
-    findings_data: list[dict],   # [{finding, dependency, patch}]
+    findings_data: list[dict],
 ) -> str:
     """
-    Create the full Issue hierarchy for a scan run.
+    Create master Issue + one RG Issue per resource group.
     Returns master Issue URL.
     """
     gh   = Github(config.GITHUB_TOKEN)
@@ -53,196 +43,87 @@ def create_audit_hierarchy(
 
     _ensure_labels(repo)
 
-    # Group findings by resource group
+    # Group by resource group — only HIGH and MEDIUM
     by_rg = defaultdict(list)
     for d in findings_data:
-        by_rg[d["finding"].resource_group].append(d)
+        if d["finding"].risk in (config.RISK_HIGH, config.RISK_MEDIUM):
+            by_rg[d["finding"].resource_group].append(d)
 
-    # ── Step 1: Create individual finding Issues ──────────────
-    print(f"\n  Creating {len(findings_data)} finding Issues...")
-    for d in findings_data:
-        issue = _create_finding_issue(repo, d, now)
-        d["issue_number"] = issue.number
-        d["issue_url"]    = issue.html_url
-        print(f"    #{issue.number} [{d['finding'].risk}] {d['finding'].title[:45]}")
+    if not by_rg:
+        print("  ℹ️  No HIGH/MEDIUM findings — no RG Issues to create")
+        return _create_clean_master(repo, report, now)
 
-    # ── Step 2: Create one RG Issue per resource group ────────
-    print(f"\n  Creating {len(by_rg)} resource group Issues...")
+    # Step 1 — One Issue per RG (all findings inside)
+    print(f"\n  Creating {len(by_rg)} RG Issues...")
     rg_issues = {}
-    for rg_name, rg_findings in sorted(by_rg.items()):
-        rg_issue = _create_rg_issue(repo, rg_name, rg_findings, now)
+    for rg_name, rg_data in sorted(by_rg.items()):
+        issue = _create_rg_issue(repo, rg_name, rg_data, now)
         rg_issues[rg_name] = {
-            "issue_number": rg_issue.number,
-            "issue_url":    rg_issue.html_url,
-            "findings":     rg_findings,
+            "issue_number": issue.number,
+            "issue_url":    issue.html_url,
+            "count":        len(rg_data),
+            "high":         len([d for d in rg_data if d["finding"].risk == config.RISK_HIGH]),
+            "medium":       len([d for d in rg_data if d["finding"].risk == config.RISK_MEDIUM]),
         }
-        print(f"    #{rg_issue.number} {rg_name} ({len(rg_findings)} findings)")
+        print(f"    #{issue.number} {rg_name} "
+              f"({rg_issues[rg_name]['high']}H "
+              f"{rg_issues[rg_name]['medium']}M)")
 
-    # ── Step 3: Create master summary Issue ───────────────────
+    # Step 2 — Master summary Issue
     print(f"\n  Creating master summary Issue...")
-    master = _create_master_issue(repo, report, rg_issues, now)
-    print(f"    #{master.number} Master summary")
-
-    print(f"\n  ✅ Issue hierarchy created:")
-    print(f"     Master:    #{master.number} → {master.html_url}")
-    for rg, info in rg_issues.items():
-        print(f"     RG:        #{info['issue_number']} {rg}")
-        for d in info["findings"]:
-            print(f"       Finding: #{d['issue_number']} {d['finding'].finding_id}")
+    master = _create_master_issue(repo, report, rg_issues, findings_data, now)
+    print(f"    #{master.number} Master summary → {master.html_url}")
 
     return master.html_url
 
 
-# ── Finding Issue ─────────────────────────────────────────────
-
-def _create_finding_issue(repo, d: dict, now: datetime):
-    """One Issue per security finding — full detail."""
-    finding    = d["finding"]
-    dependency = d["dependency"]
-    patch      = d["patch"]
-
-    risk_emoji  = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(finding.risk, "⚪")
-    blast_emoji = {"HIGH": "💥", "MEDIUM": "⚠️", "LOW": "✅"}.get(dependency.blast_radius, "⚪")
-
-    title = (
-        f"{risk_emoji} [{finding.finding_id}] {finding.title} — "
-        f"`{finding.resource_name}`"
-    )
-
-    dep_list = "\n".join(
-        f"- `{r['name']}` ({r['type']})"
-        for r in dependency.dependent_resources[:5]
-    ) or "_None found_"
-
-    accessor_list = "\n".join(
-        f"- `{a['caller']}` — last: {a['last_access']}"
-        for a in dependency.recent_accessors[:3]
-    ) or f"_No access in last {config.DEPENDENCY_LOOKBACK_DAYS} days — lower risk_"
-
-    notes_list = "\n".join(f"- {n}" for n in dependency.notes)
-    approval   = _approval_text(finding, dependency)
-    verify     = _verify_cmd(finding)
-
-    body = f"""## {risk_emoji} {finding.finding_id} — {finding.title}
-
-| Field | Value |
-|---|---|
-| **Resource** | `{finding.resource_name}` |
-| **Resource Group** | `{finding.resource_group}` |
-| **Type** | `{finding.resource_type}` |
-| **Risk** | {finding.risk} |
-| **Blast Radius** | {blast_emoji} {dependency.blast_radius} |
-| **Owner** | `{dependency.owner}` |
-| **Environment** | `{finding.environment}` |
-| **Defender** | [View in Defender for Cloud]({finding.defender_link}) |
-
-### What's wrong
-{finding.description}
-
-### Defender's remediation guidance
-{finding.remediation}
-
----
-
-## {blast_emoji} Dependency Analysis
-
-**Dependent resources** ({len(dependency.dependent_resources)} found):
-{dep_list}
-
-**Recent accessors** (last {config.DEPENDENCY_LOOKBACK_DAYS} days):
-{accessor_list}
-
-**Assessment:**
-{notes_list}
-
----
-
-## {approval}
-
----
-
-## 🔧 Terraform Fix
-
-Copy this snippet to `devops-platform-foundation` and raise a PR:
-
-```hcl
-{patch.terraform_hcl}
-```
-
-**Apply command** (after all approvals):
-```bash
-{patch.apply_command}
-```
-
-**Verify:**
-```bash
-{verify}
-```
-
-**Rollback plan:**
-{patch.rollback_plan}
-
-**Risk notes:**
-{patch.risk_notes}
-
----
-
-*[security-auditor](https://github.com/{config.GITHUB_REPO}) · \
-{now.strftime("%Y-%m-%d %H:%M UTC")} · Source: Defender for Cloud*
-"""
-
-    labels = [
-        "security",
-        "audit-finding",
-        f"risk-{finding.risk.lower()}",
-    ]
-
-    return repo.create_issue(title=title, body=body, labels=labels)
-
-
-# ── RG Issue ──────────────────────────────────────────────────
-
-def _create_rg_issue(
-    repo,
-    rg_name:     str,
-    rg_findings: list[dict],
-    now:         datetime,
-):
+def _create_rg_issue(repo, rg_name: str, rg_data: list[dict], now: datetime):
     """
     One Issue per resource group.
-    Contains a tasklist of finding Issues — checkboxes auto-tick when closed.
+    Contains all HIGH + MEDIUM findings inline — no sub-issues needed.
     """
-    high   = [d for d in rg_findings if d["finding"].risk == config.RISK_HIGH]
-    medium = [d for d in rg_findings if d["finding"].risk == config.RISK_MEDIUM]
-    low    = [d for d in rg_findings if d["finding"].risk == config.RISK_LOW]
+    high_data   = [d for d in rg_data if d["finding"].risk == config.RISK_HIGH]
+    medium_data = [d for d in rg_data if d["finding"].risk == config.RISK_MEDIUM]
 
-    # Determine RG owner from first finding's tags
-    owner = rg_findings[0]["dependency"].owner if rg_findings else "unknown"
-    env   = rg_findings[0]["finding"].environment if rg_findings else "unknown"
+    owner = rg_data[0]["dependency"].owner if rg_data else "unknown"
+    env   = rg_data[0]["finding"].environment if rg_data else "unknown"
 
-    status_emoji = "🔴" if high else "🟡" if medium else "🟢"
-
+    status_emoji = "🔴" if high_data else "🟡"
     title = (
         f"{status_emoji} Security Findings — `{rg_name}` — "
-        f"{len(rg_findings)} finding(s) "
-        f"[{len(high)}H · {len(medium)}M · {len(low)}L]"
+        f"{len(rg_data)} finding(s) "
+        f"[{len(high_data)}H · {len(medium_data)}M]"
     )
 
-    # Build tasklist — checks auto-tick when Issues are closed
-    def tasklist(findings_group):
-        lines = []
-        for d in findings_group:
-            risk_e = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(
-                d["finding"].risk, "⚪"
-            )
-            lines.append(
-                f"- [ ] {risk_e} #{d['issue_number']} "
-                f"[{d['finding'].finding_id}] {d['finding'].title[:50]} — "
-                f"`{d['finding'].resource_name}`"
-            )
-        return "\n".join(lines)
+    # ── Summary table ─────────────────────────────────────────
+    table_rows = ["| # | Severity | Finding | Resource | Blast Radius | Owner |",
+                  "|---|---|---|---|---|---|"]
+    for i, d in enumerate(high_data + medium_data, 1):
+        f   = d["finding"]
+        dep = d["dependency"]
+        sev_emoji = "🔴" if f.risk == config.RISK_HIGH else "🟡"
+        blast_emoji = {"HIGH": "💥", "MEDIUM": "⚠️", "LOW": "✅"}.get(
+            dep.blast_radius, "⚪"
+        )
+        table_rows.append(
+            f"| {i} | {sev_emoji} {f.risk} "
+            f"| {f.title[:45]} "
+            f"| `{f.resource_name}` "
+            f"| {blast_emoji} {dep.blast_radius} "
+            f"| `{dep.owner}` |"
+        )
 
-    all_tasks = tasklist(high + medium + low)
+    # ── Progress checklist ────────────────────────────────────
+    checklist = "\n".join(
+        f"- [ ] [{d['finding'].finding_id}] {d['finding'].title[:55]} — "
+        f"`{d['finding'].resource_name}`"
+        for d in (high_data + medium_data)
+    )
+
+    # ── Finding detail sections ───────────────────────────────
+    detail_sections = ""
+    for d in (high_data + medium_data):
+        detail_sections += _finding_detail_block(d) + "\n"
 
     body = f"""## {status_emoji} Resource Group: `{rg_name}`
 
@@ -250,97 +131,204 @@ def _create_rg_issue(
 |---|---|
 | **Owner** | `{owner}` |
 | **Environment** | `{env}` |
-| **Findings** | {len(rg_findings)} total · {len(high)} HIGH · {len(medium)} MEDIUM · {len(low)} LOW |
+| **HIGH findings** | {len(high_data)} |
+| **MEDIUM findings** | {len(medium_data)} |
+| **Scanned by** | Prowler — open source CSPM |
 
 ---
 
-## Findings — check off as fixed
+## Summary
 
-{all_tasks}
-
----
-
-## How to use this Issue
-
-1. **Each checkbox above is a linked finding Issue** — click to see full detail
-2. **Fix the finding** → copy Terraform snippet to `devops-platform-foundation` → raise PR
-3. **Close the finding Issue** when the PR is merged → checkbox auto-ticks here
-4. **Close this RG Issue** when all findings are resolved
+{chr(10).join(table_rows)}
 
 ---
 
+## Fix Checklist
+
+Check off each finding as you fix it:
+
+{checklist}
+
+---
+
+## Finding Details
+
+{detail_sections}
+
+---
+
+## How to fix
+
+1. **Review dependency analysis** for each finding — understand blast radius
+2. **Get sign-off** from stakeholders listed per finding
+3. **Copy the Terraform snippet** to `devops-platform-foundation`
+4. **Raise a PR** — title: `security: fix [ID] resource-name`
+5. **Check the box above** when the PR is merged
+
+---
 *[security-auditor](https://github.com/{config.GITHUB_REPO}) · \
-{now.strftime("%Y-%m-%d %H:%M UTC")}*
+Prowler scan · {now.strftime("%Y-%m-%d %H:%M UTC")}*
 """
 
-    return repo.create_issue(
-        title=title,
-        body=body,
-        labels=["security", "audit-rg"],
+    labels = ["security", "audit-rg",
+              "risk-high" if high_data else "risk-medium"]
+
+    return repo.create_issue(title=title, body=body, labels=labels)
+
+
+def _finding_detail_block(d: dict) -> str:
+    """Inline detail block for one finding inside the RG Issue."""
+    finding    = d["finding"]
+    dependency = d["dependency"]
+    patch      = d["patch"]
+
+    risk_emoji  = "🔴" if finding.risk == config.RISK_HIGH else "🟡"
+    blast_emoji = {"HIGH": "💥", "MEDIUM": "⚠️", "LOW": "✅"}.get(
+        dependency.blast_radius, "⚪"
     )
 
+    dep_list = "\n".join(
+        f"  - `{r['name']}` ({r['type']})"
+        for r in dependency.dependent_resources[:3]
+    ) or "  _None found_"
 
-# ── Master Summary Issue ──────────────────────────────────────
+    accessor_list = "\n".join(
+        f"  - `{a['caller']}` — last: {a['last_access']}"
+        for a in dependency.recent_accessors[:3]
+    ) or f"  _No access in last {config.DEPENDENCY_LOOKBACK_DAYS} days_"
+
+    approval = _approval_text(finding, dependency)
+    verify   = _verify_cmd(finding)
+
+    return f"""<details>
+<summary>{risk_emoji} <strong>[{finding.finding_id}]</strong> \
+{finding.title} — <code>{finding.resource_name}</code> \
+{blast_emoji} {dependency.blast_radius} blast radius</summary>
+
+**What's wrong:**
+{finding.description}
+
+**Prowler check:** `{finding.prowler_check_id}`
+
+**Remediation guidance:**
+{finding.remediation}
+
+---
+
+**{blast_emoji} Dependency Analysis**
+
+Dependent resources:
+{dep_list}
+
+Recent accessors (last {config.DEPENDENCY_LOOKBACK_DAYS} days):
+{accessor_list}
+
+Notes:
+{"  ".join(f"- {n}" for n in dependency.notes) or "  _No notes_"}
+
+---
+
+**{approval}**
+
+---
+
+**Terraform Fix** — copy to `devops-platform-foundation`:
+```hcl
+{patch.terraform_hcl}
+```
+
+Apply after approval:
+```bash
+{patch.apply_command}
+```
+
+Verify:
+```bash
+{verify}
+```
+
+Rollback: {patch.rollback_plan}
+
+</details>
+"""
+
 
 def _create_master_issue(
     repo,
-    report:    ScanReport,
-    rg_issues: dict,
-    now:       datetime,
+    report:      ScanReport,
+    rg_issues:   dict,
+    all_data:    list[dict],
+    now:         datetime,
 ):
-    """
-    One master Issue per scan run.
-    Links to all RG Issues — gives the full picture at a glance.
-    """
-    total_high   = len(report.high)
-    total_medium = len(report.medium)
-    total_low    = len(report.low)
-    status_emoji = "🔴" if total_high else "🟡" if total_medium else "🟢"
+    """Master summary — links to all RG Issues."""
+    high_count   = len(report.high)
+    medium_count = len(report.medium)
+    low_count    = len(report.low)
+    actioned     = high_count + medium_count
+
+    status_emoji = "🔴" if high_count else "🟡" if medium_count else "🟢"
 
     title = (
         f"🔍 Weekly Security Audit — {report.run_date} — "
-        f"{len(report.findings)} finding(s) "
-        f"[{total_high}H · {total_medium}M · {total_low}L]"
+        f"{len(rg_issues)} RG(s) — "
+        f"{actioned} actioned "
+        f"[{high_count}H · {medium_count}M]"
     )
 
-    # RG tasklist — links to RG Issues
-    rg_tasklist = "\n".join(
-        f"- [ ] #{info['issue_number']} "
-        f"`{rg}` — {len(info['findings'])} finding(s) "
-        f"[{len([d for d in info['findings'] if d['finding'].risk=='HIGH'])}H · "
-        f"{len([d for d in info['findings'] if d['finding'].risk=='MEDIUM'])}M · "
-        f"{len([d for d in info['findings'] if d['finding'].risk=='LOW'])}L]"
+    # RG summary table
+    rg_table = (
+        "| Resource Group | HIGH | MEDIUM | Issue |\n"
+        "|---|---|---|---|\n"
+    )
+    for rg, info in sorted(rg_issues.items()):
+        rg_table += (
+            f"| `{rg}` "
+            f"| {'🔴 ' + str(info['high']) if info['high'] else '-'} "
+            f"| {'🟡 ' + str(info['medium']) if info['medium'] else '-'} "
+            f"| #{info['issue_number']} |\n"
+        )
+
+    # RG checklist
+    rg_checklist = "\n".join(
+        f"- [ ] #{info['issue_number']} `{rg}` — "
+        f"{info['high']}H · {info['medium']}M"
         for rg, info in sorted(rg_issues.items())
     )
 
-    # Summary table by resource group
-    rg_table = "| Resource Group | Owner | HIGH | MEDIUM | LOW | RG Issue |\n|---|---|---|---|---|---|\n"
-    for rg, info in sorted(rg_issues.items()):
-        h = len([d for d in info["findings"] if d["finding"].risk == "HIGH"])
-        m = len([d for d in info["findings"] if d["finding"].risk == "MEDIUM"])
-        l = len([d for d in info["findings"] if d["finding"].risk == "LOW"])
-        owner = info["findings"][0]["dependency"].owner if info["findings"] else "unknown"
-        rg_table += (
-            f"| `{rg}` | `{owner}` | "
-            f"{'🔴 ' + str(h) if h else '-'} | "
-            f"{'🟡 ' + str(m) if m else '-'} | "
-            f"{'🟢 ' + str(l) if l else '-'} | "
-            f"#{info['issue_number']} |\n"
-        )
+    # LOW findings summary (listed but not actioned)
+    low_summary = ""
+    if report.low:
+        low_summary = f"""---
+
+## 🟢 LOW Severity — {low_count} findings (informational)
+
+These are best-practice gaps. No immediate action required.
+
+| Finding | Resource | RG |
+|---|---|---|
+"""
+        for d in all_data:
+            if d["finding"].risk == config.RISK_LOW:
+                f = d["finding"]
+                low_summary += (
+                    f"| {f.title[:50]} | `{f.resource_name}` "
+                    f"| `{f.resource_group}` |\n"
+                )
 
     body = f"""## 🔍 Weekly Security Audit — {report.run_date}
 
-**Source:** Microsoft Defender for Cloud
+**Scanner:** Prowler (open source CSPM — 300+ Azure checks)
 **Subscription:** `{report.subscription_id}`
 
 | Metric | Value |
 |---|---|
 | Total assessed | {report.total_assessed} |
-| Healthy (compliant) | {report.total_healthy} |
-| 🔴 HIGH | {total_high} |
-| 🟡 MEDIUM | {total_medium} |
-| 🟢 LOW | {total_low} |
-| **Non-compliant total** | **{len(report.findings)}** |
+| Healthy | {report.total_healthy} |
+| 🔴 HIGH | {high_count} |
+| 🟡 MEDIUM | {medium_count} |
+| 🟢 LOW (info only) | {low_count} |
+| **Actioned (H+M)** | **{actioned}** |
+| Resource groups affected | {len(rg_issues)} |
 
 ---
 
@@ -352,31 +340,28 @@ def _create_master_issue(
 
 ## Resource Group Issues — check off as resolved
 
-{rg_tasklist}
+{rg_checklist}
 
 ---
 
 ## How this works
 
-```
-This Issue (master)
-  └── RG Issue per resource group  ← one team's findings
-        └── Finding Issue per finding  ← full detail, terraform fix, sign-off
-```
+Each RG Issue above contains:
+- Summary table of all findings
+- Fix checklist (check off as you fix each one)
+- Collapsible detail per finding with dependency analysis + Terraform patch
 
-1. **Click a RG Issue** → see all findings for that resource group
-2. **Click a finding Issue** → see dependency analysis, Terraform fix, sign-off checklist
-3. **Fix the finding** → raise PR in `devops-platform-foundation` → merge
-4. **Close the finding Issue** → checkbox auto-ticks in the RG Issue
-5. **Close the RG Issue** → checkbox auto-ticks here
+**LOW findings** are listed below for awareness — no Issue created for them.
+
+{low_summary}
 
 ---
 
 > No changes applied automatically.
-> Each finding Issue has the Terraform snippet ready to copy.
+> Fix finding → raise PR in `devops-platform-foundation` → merge → check the box.
 
 *[security-auditor](https://github.com/{config.GITHUB_REPO}) · \
-{now.strftime("%Y-%m-%d %H:%M UTC")} · Defender for Cloud API*
+Prowler · {now.strftime("%Y-%m-%d %H:%M UTC")}*
 """
 
     return repo.create_issue(
@@ -386,43 +371,52 @@ This Issue (master)
     )
 
 
-# ── Helpers ───────────────────────────────────────────────────
+def _create_clean_master(repo, report: ScanReport, now: datetime):
+    """Master Issue when no HIGH/MEDIUM findings."""
+    issue = repo.create_issue(
+        title=f"✅ Weekly Security Audit — {report.run_date} — All clear",
+        body=f"""## ✅ No HIGH or MEDIUM findings
+
+**Scanner:** Prowler
+**Subscription:** `{report.subscription_id}`
+**Assessed:** {report.total_assessed} resources
+**LOW findings:** {len(report.low)} (informational only)
+
+Subscription is clean for this week. 🎉
+
+*[security-auditor](https://github.com/{config.GITHUB_REPO}) · {now.strftime("%Y-%m-%d %H:%M UTC")}*
+""",
+        labels=["security", "audit-master"],
+    )
+    return issue.html_url
+
 
 def _approval_text(finding: Finding, dep: DependencyReport) -> str:
     stakeholders = dep.all_stakeholders
     if finding.risk == config.RISK_HIGH or dep.blast_radius == config.RISK_HIGH:
-        checks = "\n".join(
-            f"- [ ] Stakeholder: `{s}`" for s in stakeholders
-        )
+        checks = "\n".join(f"- [ ] `{s}`" for s in stakeholders)
         return (
             f"✋ Sign-off Required — HIGH RISK\n\n"
             f"- [ ] Owner: `{dep.owner}`\n"
             f"{checks}\n"
             f"- [ ] Test in non-production first\n"
-            f"- [ ] Schedule maintenance window\n"
-            f"- [ ] Notify on-call team"
+            f"- [ ] Schedule maintenance window"
         )
-    elif finding.risk == config.RISK_MEDIUM:
-        return (
-            f"⚠️ Sign-off Required — MEDIUM RISK\n\n"
-            f"- [ ] Team lead: `{dep.owner}`\n"
-            f"- [ ] Verify no dependent services break\n"
-            f"- [ ] Apply during low-traffic window"
-        )
-    return f"✅ LOW RISK — one reviewer from `{dep.owner}`"
+    return (
+        f"⚠️ Sign-off Required — MEDIUM RISK\n\n"
+        f"- [ ] Team lead: `{dep.owner}`\n"
+        f"- [ ] Verify no dependent services break"
+    )
 
 
 def _verify_cmd(finding: Finding) -> str:
     cmds = {
-        "storage":        f"az storage account show --name {finding.resource_name} --query '{{public:allowBlobPublicAccess,sharedKey:allowSharedKeyAccess}}'",
-        "managedcluster": f"az aks show --name {finding.resource_name} -g {finding.resource_group} --query apiServerAccessProfile",
-        "vault":          f"az keyvault show --name {finding.resource_name} --query properties.{{softDelete:enableSoftDelete,network:networkAcls}}",
+        "stor": f"az storage account show --name {finding.resource_name} --query '{{public:allowBlobPublicAccess,sharedKey:allowSharedKeyAccess}}'",
+        "mana": f"az aks show --name {finding.resource_name} -g {finding.resource_group} --query apiServerAccessProfile",
+        "vaul": f"az keyvault show --name {finding.resource_name} --query properties.networkAcls",
     }
-    rt = finding.resource_type.lower()
-    for key, cmd in cmds.items():
-        if key in rt:
-            return cmd
-    return f"az resource show --ids {finding.resource_id} --query properties"
+    rt = finding.resource_type.lower().split("/")[-1][:4]
+    return cmds.get(rt, f"az resource show --ids {finding.resource_id} --query properties")
 
 
 def _ensure_labels(repo):

@@ -40,10 +40,12 @@ def main():
         print("\n✅ No non-compliant resources — subscription is clean!")
         return
 
-    # Step 2 — Process each finding (HIGH → MEDIUM → LOW)
-    print(f"\nAnalysing {len(report.findings)} findings...\n")
+    # Step 2 — Process only HIGH + MEDIUM (LOW listed in master Issue only)
+    actionable = report.high + report.medium
+    print(f"\nAnalysing {len(actionable)} actionable findings "
+          f"({len(report.low)} LOW skipped — listed in master Issue only)...\n")
     findings_data = []
-    for finding in (report.high + report.medium + report.low):
+    for finding in actionable:
         try:
             findings_data.append(process_finding(finding))
         except Exception as e:
