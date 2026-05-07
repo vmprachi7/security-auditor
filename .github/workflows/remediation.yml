@@ -46,7 +46,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # Verify Prowler installed correctly
+          prowler --version
 
       - name: Run security scan
         env:
