@@ -1,25 +1,17 @@
 {
-  "properties": {
-    "displayName": "Deny storage accounts with public blob access",
-    "description": "Prevents creation or update of storage accounts that allow anonymous public read access to blobs. This policy enforces shift-left security by blocking misconfigured resources at deployment time.",
-    "mode": "All",
-    "policyRule": {
-      "if": {
-        "allOf": [
-          {
-            "field": "type",
-            "equals": "Microsoft.Storage/storageAccounts"
-          },
-          {
-            "field": "Microsoft.Storage/storageAccounts/allowBlobPublicAccess",
-            "equals": "true"
-          }
-        ]
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.Storage/storageAccounts"
       },
-      "then": {
-        "effect": "Deny"
+      {
+        "field": "Microsoft.Storage/storageAccounts/allowBlobPublicAccess",
+        "equals": "true"
       }
-    },
-    "parameters": {}
+    ]
+  },
+  "then": {
+    "effect": "Deny"
   }
 }

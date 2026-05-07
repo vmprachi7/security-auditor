@@ -1,35 +1,17 @@
 {
-  "properties": {
-    "displayName": "Require owner tag on resource groups",
-    "description": "All resource groups must have an 'owner' tag. This enables automated dependency analysis, blast radius calculation, and sign-off routing for security patches.",
-    "mode": "All",
-    "policyRule": {
-      "if": {
-        "allOf": [
-          {
-            "field": "type",
-            "equals": "Microsoft.Resources/subscriptions/resourceGroups"
-          },
-          {
-            "field": "tags['owner']",
-            "exists": "false"
-          }
-        ]
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.Resources/subscriptions/resourceGroups"
       },
-      "then": {
-        "effect": "[parameters('effect')]"
+      {
+        "field": "tags['owner']",
+        "exists": "false"
       }
-    },
-    "parameters": {
-      "effect": {
-        "type": "String",
-        "defaultValue": "Audit",
-        "allowedValues": ["Audit", "Deny"],
-        "metadata": {
-          "displayName": "Effect",
-          "description": "Audit logs non-compliant resources. Deny blocks creation."
-        }
-      }
-    }
+    ]
+  },
+  "then": {
+    "effect": "[parameters('effect')]"
   }
 }
