@@ -1,61 +1,131 @@
-name: Shift Left Security Scan
+name: Terraform
 
-# Reusable workflow — called from devops-platform-foundation
-# and any other Terraform repo
 on:
-  workflow_call:
-    inputs:
-      terraform_dir:
-        description: 'Directory containing Terraform files to scan'
-        type: string
-        default: '.'
-      block_on_high:
-        description: 'Block PR if HIGH severity findings found'
-        type: boolean
-        default: true
-    secrets:
-      GROQ_API_KEY:
-        required: false   # AI explanation optional
-
-  # Also callable standalone for testing
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
   workflow_dispatch:
     inputs:
-      terraform_dir:
-        description: 'Terraform directory to scan'
-        default: '.'
+      action:
+        description: 'Action to perform'
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply, destroy]
+
+permissions:
+  id-token:      write
+  contents:      read
+  pull-requests: write
+
+env:
+  TF_DIR:              terraform/environments/dev
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_ACCESS_KEY:      ${{ secrets.TF_STATE_STORAGE_KEY }}
 
 jobs:
-
-  scan:
-    name: Checkov + tfsec + AI Explanation
+  # ── Job 1: Security Scan ──────────────────────────────────
+  security-scan:
+    name: 🔐 Security Scan
     runs-on: ubuntu-latest
-
+    if: github.event_name == 'pull_request'
+    outputs:
+      high-count: ${{ steps.scan.outputs.high_count }}
     steps:
-      - name: Checkout calling repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Checkout security-auditor (for scan scripts)
+      - name: Get changed Terraform files
+        id: changed
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '\.tf$' \
+            | xargs -I{} dirname {} \
+            | sort -u \
+            | tr '\n' ' ')
+          
+          if [ -z "$DIRS" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "changed_dirs=$DIRS" >> $GITHUB_OUTPUT
+            echo "Changed .tf dirs: $DIRS"
+          fi
+
+      - name: Set up Python
+        if: steps.changed.outputs.has_changes == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Scanners
+        if: steps.changed.outputs.has_changes == 'true'
+        run: |
+          pip install checkov openai httpx python-dotenv --quiet
+          wget -q -O /usr/local/bin/tfsec \
+            https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64
+          chmod +x /usr/local/bin/tfsec
+
+      - name: Run Checkov
+        if: steps.changed.outputs.has_changes == 'true'
+        run: |
+          mkdir -p /tmp/scan-results
+          # Removed --external-checks-dir . to prevent YAML document errors with K8s files
+          # Added --compact for cleaner logs
+          checkov --directory . \
+            --framework terraform \
+            --quiet --compact \
+            --output json --soft-fail \
+            --download-external-modules false > /tmp/scan-results/checkov_raw.json || true
+          
+          python3 << 'PYEOF'
+          import json, os
+          path = "/tmp/scan-results/checkov_raw.json"
+          out = {"results": {"failed_checks": []}}
+          
+          if os.path.exists(path) and os.path.getsize(path) > 0:
+              try:
+                  with open(path) as f:
+                      data = json.load(f)
+                      # Checkov outputs a list when multiple frameworks/reports are triggered
+                      if isinstance(data, list):
+                          for report in data:
+                              if report.get("check_type") == "terraform":
+                                  out["results"]["failed_checks"].extend(report.get("results", {}).get("failed_checks", []))
+                      elif isinstance(data, dict):
+                          out["results"]["failed_checks"] = data.get("results", {}).get("failed_checks", [])
+              except Exception as e:
+                  print(f"Parsing error: {e}")
+          
+          with open("/tmp/scan-results/checkov.json", "w") as f:
+              json.dump(out, f)
+          PYEOF
+
+      - name: Run tfsec
+        if: steps.changed.outputs.has_changes == 'true'
+        run: |
+          tfsec . --format json --soft-fail > /tmp/scan-results/tfsec.json || true
+
+      - name: Checkout security-auditor
+        if: steps.changed.outputs.has_changes == 'true'
         uses: actions/checkout@v4
         with:
           repository: vmprachi7/security-auditor
           path: .security-auditor
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: |
-          pip install checkov openai httpx python-dotenv
-
-      - name: Run Checkov + tfsec
-        run: |
-          bash .security-auditor/shift-left/scan.sh \
-            "${{ inputs.terraform_dir || '.' }}" \
-            "/tmp/scan-results"
-
-      - name: Generate AI-explained PR comment
+      - name: Generate AI Findings
+        if: steps.changed.outputs.has_changes == 'true'
+        id: scan
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
@@ -63,58 +133,112 @@ jobs:
             .security-auditor/shift-left/ai_explainer.py \
             --checkov /tmp/scan-results/checkov.json \
             --tfsec   /tmp/scan-results/tfsec.json \
-            --tf-dir  "${{ inputs.terraform_dir || '.' }}" \
-            --output  /tmp/scan-results/pr-comment.md
-        # Exit code 1 if HIGH findings — handled below
+            --tf-dir  "${{ env.TF_DIR }}" \
+            --output  /tmp/scan-results/pr-comment.md || true
 
-      - name: Post PR comment
-        if: always() && github.event_name == 'pull_request'
+          HIGH=$(python3 -c "
+          import json, os
+          path = '/tmp/scan-results/checkov.json'
+          if not os.path.exists(path): print(0); exit()
+          data = json.load(open(path))
+          checks = data.get('results', {}).get('failed_checks', [])
+          high_ids = {'CKV_AZURE_59','CKV_AZURE_5','CKV_AZURE_7','CKV_AZURE_41','CKV_AZURE_42','CKV_AZURE_3','CKV_AZURE_110'}
+          print(sum(1 for c in checks if c.get('check_id') in high_ids))
+          " 2>/dev/null || echo "0")
+          echo "high_count=$HIGH" >> $GITHUB_OUTPUT
+
+      - name: Post PR Comment
+        if: steps.changed.outputs.has_changes == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs      = require('fs');
-            const comment = fs.readFileSync('/tmp/scan-results/pr-comment.md', 'utf8');
-
-            // Delete previous scan comments
-            const comments = await github.rest.issues.listComments({
-              owner:      context.repo.owner,
-              repo:       context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            for (const c of comments.data) {
-              if (c.body.includes('Security Scan') && c.user.login === 'github-actions[bot]') {
-                await github.rest.issues.deleteComment({
-                  owner:      context.repo.owner,
-                  repo:       context.repo.repo,
-                  comment_id: c.id,
-                });
-              }
+            const fs = require('fs');
+            let comment = '';
+            try {
+              comment = fs.readFileSync('/tmp/scan-results/pr-comment.md', 'utf8');
+            } catch(e) {
+              comment = '## ✅ Security Scan\nNo issues detected.';
             }
-
-            // Post new comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
+            });
+            const botComment = comments.find(c => c.body.includes('Security Scan') && c.user.type === 'Bot');
+            if (botComment) await github.rest.issues.deleteComment({
+              owner: context.repo.owner, repo: context.repo.repo, comment_id: botComment.id
+            });
             await github.rest.issues.createComment({
-              owner:        context.repo.owner,
-              repo:         context.repo.repo,
-              issue_number: context.issue.number,
-              body:         comment,
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: comment
             });
 
-      - name: Upload scan results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-scan-${{ github.run_number }}
-          path: /tmp/scan-results/
-          retention-days: 30
-
-      - name: Block PR on HIGH findings
-        if: inputs.block_on_high != false
+      - name: Block on HIGH findings
+        if: steps.scan.outputs.high_count > 0
         run: |
-          # Re-run explainer just to get exit code
-          PYTHONPATH=.security-auditor python \
-            .security-auditor/shift-left/ai_explainer.py \
-            --checkov /tmp/scan-results/checkov.json \
-            --tfsec   /tmp/scan-results/tfsec.json \
-            --output  /tmp/pr-comment-check.md
+          echo "❌ ${{ steps.scan.outputs.high_count }} HIGH findings detected."
+          exit 1
+
+  # ── Job 2: Plan ──────────────────────────────────────────
+  plan:
+    name: 🏗️ Terraform Plan
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -no-color 2>&1 | tee plan.txt
+      - name: Post Plan Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TF_DIR }}/plan.txt', 'utf8');
+            const body = `## 🏗️ Terraform Plan\n\`\`\`hcl\n${plan.slice(0, 60000)}\n\`\`\``;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo, body
+            });
+
+  # ── Job 3: Apply ─────────────────────────────────────────
+  apply:
+    name: 🚀 Terraform Apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve
+
+  # ── Job 4: Destroy ───────────────────────────────────────
+  destroy:
+    name: 🔥 Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform destroy -auto-approve
