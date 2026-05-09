@@ -39,7 +39,9 @@ Custom policy definitions applied at subscription scope:
   Deny storage accounts with public blob access
   Require owner tag on all resource groups
 ```
-
+Samples
+- [SHIFT LEFT](https://github.com/vmprachi7/devops-platform-foundation/pull/2)
+- [REMEDIATION](https://github.com/vmprachi7/security-auditor/issues/233)
 ---
 
 ## Technology stack
